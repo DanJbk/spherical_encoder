@@ -3,6 +3,7 @@ torch
 torchvision
 pytorch-lightning
 torchmetrics
+einops
 
 # Data & Math
 numpy

@@ -1,0 +1,29 @@
+# Core Framework
+torch
+torchvision
+pytorch-lightning
+torchmetrics
+
+# Data & Math
+numpy
+scipy
+pandas
+scikit-learn
+Pillow
+
+# Computer Vision Specific
+timm
+albumentations
+opencv-python-headless  # Use -headless for servers/Docker
+
+# Visualization & Progress
+matplotlib
+seaborn         # Better looking heatmaps/confusion matrices
+tqdm
+
+# Experiment Tracking (Pick one)
+# wandb
+# tensorboard
+
+jupyter
+lightning

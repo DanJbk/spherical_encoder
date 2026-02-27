@@ -191,8 +191,10 @@ class SphereEncoderViT(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # w = self.patch_embed.weight.data
-        # nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        w1 = self.patch_embed[0].weight.data
+        nn.init.xavier_uniform_(w1.view(w1.shape[0], -1))
+        w2 = self.patch_embed[1].weight.data
+        nn.init.xavier_uniform_(w2.view(w2.shape[0], -1))
         nn.init.normal_(self.class_embed.weight, std=0.02)
         nn.init.normal_(self.null_class_embed, std=0.02)
 

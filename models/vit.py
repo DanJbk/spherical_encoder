@@ -5,17 +5,6 @@ import torch.nn as nn
 # 1. Utility & Normalization Modules
 # ==========================================
 
-class RMSNorm(nn.Module):
-    """RMSNorm with learned affine parameters to bound latent magnitude."""
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True) / (x.size(-1) ** 0.5)
-        return (x / (norm + self.eps)) * self.weight
-
 def modulate(x, shift, scale):
     """Applies AdaLN modulation."""
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -145,6 +134,7 @@ class MLPMixerBlock(nn.Module):
         self.token_mix = Mlp(seq_len, tokens_mlp_dim, seq_len)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.channel_mix = Mlp(hidden_dim, channels_mlp_dim, hidden_dim)
+        self.mixer_norm = nn.RMSNorm(hidden_dim, elementwise_affine=True)
 
     def forward(self, x):
         res = x
@@ -152,6 +142,7 @@ class MLPMixerBlock(nn.Module):
         x = self.token_mix(x).transpose(1, 2)
         x = x + res
         x = x + self.channel_mix(self.norm2(x))
+        x = self.mixer_norm(x)
         return x
 
 # ==========================================
@@ -159,14 +150,18 @@ class MLPMixerBlock(nn.Module):
 # ==========================================
 
 class SphereEncoderViT(nn.Module):
-    def __init__(self, img_size=256, patch_size=16, in_channels=3, latent_channels=128, 
+    def __init__(self, img_size=256, patch_size=16, in_channels=3,
                  hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, 
-                 mixer_layers=4, tokens_mlp_ratio=0.5, channels_mlp_ratio=4.0):
+                 mixer_layers=4, tokens_mlp_ratio=0.5, channels_mlp_ratio=4.0, class_embed_dropout=0.1):
         super().__init__()
         self.grid_size = img_size // patch_size
         self.seq_len = self.grid_size ** 2
+        self.class_embed_dropout = class_embed_dropout
         
-        self.patch_embed = nn.Conv2d(in_channels, hidden_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=patch_size, stride=patch_size, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+            )
         
         # Absolute Positional Embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, hidden_dim), requires_grad=False)
@@ -193,14 +188,11 @@ class SphereEncoderViT(nn.Module):
             for _ in range(mixer_layers)
         ])
         
-        self.mixer_norm = RMSNorm(hidden_dim)
-        self.latent_proj = nn.Linear(hidden_dim, latent_channels)
-        
         self.initialize_weights()
 
     def initialize_weights(self):
-        w = self.patch_embed.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        # w = self.patch_embed.weight.data
+        # nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.normal_(self.class_embed.weight, std=0.02)
         nn.init.normal_(self.null_class_embed, std=0.02)
 
@@ -210,6 +202,9 @@ class SphereEncoderViT(nn.Module):
         x = x + self.pos_embed
         
         c = self.class_embed(class_labels) if class_labels is not None else self.null_class_embed.expand(B, -1)
+        if class_labels is not None and self.training and self.class_embed_dropout > 0:
+            dropout_mask = torch.rand(B, device=x.device) < self.class_embed_dropout
+            c = torch.where(dropout_mask.unsqueeze(1), self.null_class_embed.expand(B, -1), c)
         
         for vit_blk in self.vit_blocks:
             x = vit_blk(x, c, self.freqs_cis)
@@ -217,10 +212,6 @@ class SphereEncoderViT(nn.Module):
         for mixer_blk in self.mixer_blocks:
             x = mixer_blk(x)
             
-        x = self.mixer_norm(x)
-        x = self.latent_proj(x)
-        
-        # Output: (B, Seq_Len, Latent_Channels)
         return x
 
 # ==========================================
@@ -228,7 +219,7 @@ class SphereEncoderViT(nn.Module):
 # ==========================================
 
 class SphereDecoderViT(nn.Module):
-    def __init__(self, img_size=256, patch_size=16, out_channels=3, latent_channels=128, 
+    def __init__(self, img_size=256, patch_size=16, out_channels=3,
                  hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, 
                  mixer_layers=4, tokens_mlp_ratio=0.5, channels_mlp_ratio=4.0):
         super().__init__()
@@ -237,7 +228,6 @@ class SphereDecoderViT(nn.Module):
         self.grid_size = img_size // patch_size
         self.seq_len = self.grid_size ** 2
         
-        self.latent_proj = nn.Linear(latent_channels, hidden_dim)
         
         # MLP-Mixer at the BEGINNING of the decoder
         tokens_mlp_dim = int(self.seq_len * tokens_mlp_ratio)
@@ -246,8 +236,6 @@ class SphereDecoderViT(nn.Module):
             MLPMixerBlock(self.seq_len, hidden_dim, tokens_mlp_dim, channels_mlp_dim)
             for _ in range(mixer_layers)
         ])
-        
-        self.mixer_norm = RMSNorm(hidden_dim)
         
         # Absolute Positional Embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, hidden_dim), requires_grad=False)
@@ -279,12 +267,10 @@ class SphereDecoderViT(nn.Module):
     def forward(self, x, class_labels=None):
         # Input 'x' expected shape: (B, Seq_Len, Latent_Channels)
         B = x.shape[0]
-        x = self.latent_proj(x)
         
         for mixer_blk in self.mixer_blocks:
             x = mixer_blk(x)
             
-        x = self.mixer_norm(x)
         x = x + self.pos_embed
         
         c = self.class_embed(class_labels) if class_labels is not None else self.null_class_embed.expand(B, -1)
@@ -307,7 +293,6 @@ if __name__ == "__main__":
     img_size = 256
     patch_size = 16
     in_channels = 3
-    latent_channels = 128  # Following the L=32x32x128 setup for large images
     hidden_dim = 1024
     num_classes = 1000
 
@@ -316,7 +301,6 @@ if __name__ == "__main__":
         img_size=img_size, 
         patch_size=patch_size, 
         in_channels=in_channels, 
-        latent_channels=latent_channels, 
         hidden_dim=hidden_dim, 
         num_classes=num_classes
     )
@@ -325,7 +309,6 @@ if __name__ == "__main__":
         img_size=img_size, 
         patch_size=patch_size, 
         out_channels=in_channels, 
-        latent_channels=latent_channels, 
         hidden_dim=hidden_dim, 
         num_classes=num_classes
     )

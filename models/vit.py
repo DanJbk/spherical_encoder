@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # ==========================================
 # 1. Utility & Normalization Modules
@@ -60,6 +61,19 @@ def apply_rotary_emb(x, freqs_cis):
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2) # (1, SeqLen, 1, head_dim//2)
     x_out = torch.view_as_real(x_ * freqs_cis).flatten(3)
     return x_out.type_as(x)
+
+
+def sphereify(latents, sigma=1, noise=None):
+    latents = F.rms_norm(latents, latents.shape[1:], eps=1e-6)
+
+    if noise:
+        view_shape = [latents.shape[0]] + [1] * (latents.ndim - 1)
+        
+        sigma = (sigma * torch.rand(latents.shape[0])).view(*view_shape)
+        noise_latent = torch.randn_like(latents)
+        latents = F.rms_norm((latents + sigma * noise_latent), latents.shape[1:], eps=1e-6)
+    
+    return latents
 
 # ==========================================
 # 3. Core Transformer Blocks
@@ -151,7 +165,7 @@ class MLPMixerBlock(nn.Module):
 
 class SphereEncoderViT(nn.Module):
     def __init__(self, img_size=256, patch_size=16, in_channels=3,
-                 hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, 
+                 hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, latent_channels=16,
                  mixer_layers=4, tokens_mlp_ratio=0.5, channels_mlp_ratio=4.0, class_embed_dropout=0.1):
         super().__init__()
         self.grid_size = img_size // patch_size
@@ -181,12 +195,18 @@ class SphereEncoderViT(nn.Module):
         ])
         
         # MLP-Mixer at the END of the encoder
+        self.ffn = nn.Linear(hidden_dim, latent_channels) # todo replace with modulated linear layer
+
         tokens_mlp_dim = int(self.seq_len * tokens_mlp_ratio)
-        channels_mlp_dim = int(hidden_dim * channels_mlp_ratio)
+        channels_mlp_dim = int(latent_channels * channels_mlp_ratio)
         self.mixer_blocks = nn.ModuleList([
-            MLPMixerBlock(self.seq_len, hidden_dim, tokens_mlp_dim, channels_mlp_dim)
+            MLPMixerBlock(self.seq_len, latent_channels, tokens_mlp_dim, channels_mlp_dim)
             for _ in range(mixer_layers)
         ])
+
+        # self.ffn = ModulatedLinear(
+        #         self.hidden_size, intermediate_chns, use_modulation=self.use_modulation
+        #     )
         
         self.initialize_weights()
 
@@ -195,6 +215,7 @@ class SphereEncoderViT(nn.Module):
         nn.init.xavier_uniform_(w1.view(w1.shape[0], -1))
         w2 = self.patch_embed[1].weight.data
         nn.init.xavier_uniform_(w2.view(w2.shape[0], -1))
+        nn.init.constant_(self.patch_embed[1].bias, 0)
         nn.init.normal_(self.class_embed.weight, std=0.02)
         nn.init.normal_(self.null_class_embed, std=0.02)
 
@@ -211,8 +232,10 @@ class SphereEncoderViT(nn.Module):
         for vit_blk in self.vit_blocks:
             x = vit_blk(x, c, self.freqs_cis)
             
+        x = self.ffn(x)
         for mixer_blk in self.mixer_blocks:
             x = mixer_blk(x)
+
             
         return x
 
@@ -222,7 +245,7 @@ class SphereEncoderViT(nn.Module):
 
 class SphereDecoderViT(nn.Module):
     def __init__(self, img_size=256, patch_size=16, out_channels=3,
-                 hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, 
+                 hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, latent_channels=16,
                  mixer_layers=4, tokens_mlp_ratio=0.5, channels_mlp_ratio=4.0):
         super().__init__()
         self.img_size = img_size
@@ -230,10 +253,10 @@ class SphereDecoderViT(nn.Module):
         self.grid_size = img_size // patch_size
         self.seq_len = self.grid_size ** 2
         
-        
         # MLP-Mixer at the BEGINNING of the decoder
         tokens_mlp_dim = int(self.seq_len * tokens_mlp_ratio)
         channels_mlp_dim = int(hidden_dim * channels_mlp_ratio)
+        self.ffn = nn.Linear(latent_channels, hidden_dim)
         self.mixer_blocks = nn.ModuleList([
             MLPMixerBlock(self.seq_len, hidden_dim, tokens_mlp_dim, channels_mlp_dim)
             for _ in range(mixer_layers)
@@ -258,7 +281,7 @@ class SphereDecoderViT(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         
         # Unpatchify Head
-        self.head = nn.Linear(hidden_dim, patch_size * patch_size * out_channels)
+        self.head = nn.Linear(hidden_dim, patch_size * patch_size * out_channels) # todo replace with conv2d head
         
         self.initialize_weights()
 
@@ -270,6 +293,7 @@ class SphereDecoderViT(nn.Module):
         # Input 'x' expected shape: (B, Seq_Len, Latent_Channels)
         B = x.shape[0]
         
+        x = self.ffn(x)
         for mixer_blk in self.mixer_blocks:
             x = mixer_blk(x)
             
@@ -286,6 +310,7 @@ class SphereDecoderViT(nn.Module):
         # Fold back into Image Format
         x = x.reshape(B, self.grid_size, self.grid_size, self.patch_size, self.patch_size, -1)
         x = x.permute(0, 5, 1, 3, 2, 4).reshape(B, -1, self.img_size, self.img_size)
+
         return x
     
 
@@ -295,8 +320,10 @@ if __name__ == "__main__":
     img_size = 256
     patch_size = 16
     in_channels = 3
-    hidden_dim = 1024
+    hidden_dim = 512
     num_classes = 1000
+    num_heads = 8
+    depth = 8
 
     print("Instantiating Sphere Encoder and Decoder...")
     encoder = SphereEncoderViT(
@@ -304,7 +331,9 @@ if __name__ == "__main__":
         patch_size=patch_size, 
         in_channels=in_channels, 
         hidden_dim=hidden_dim, 
-        num_classes=num_classes
+        num_classes=num_classes,
+        num_heads=num_heads,
+        depth=depth,
     )
     
     decoder = SphereDecoderViT(
@@ -312,7 +341,9 @@ if __name__ == "__main__":
         patch_size=patch_size, 
         out_channels=in_channels, 
         hidden_dim=hidden_dim, 
-        num_classes=num_classes
+        num_classes=num_classes,
+        num_heads=num_heads,
+        depth=depth,
     )
 
     # --- Dummy Inputs ---
@@ -330,7 +361,7 @@ if __name__ == "__main__":
     # 1. Encode
     latents_cond = encoder(dummy_img, class_labels=dummy_labels)
     print(f"Encoder Output (Latents) Shape: {latents_cond.shape}") 
-    # Expected: (2, 256, 128) where 256 is the seq_len (256//16)^2
+    # Expected: (2, 256, 1024) where 256 is the seq_len (256//16)^2
 
     # ---> YOUR SPHERIFICATION LOGIC GOES HERE <---
     # e.g., v = f(latents_cond + sigma * e)

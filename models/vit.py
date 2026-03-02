@@ -79,6 +79,22 @@ def sphereify(latents, sigma=1, noise=None):
 # 3. Core Transformer Blocks
 # ==========================================
 
+class SwiGLUFFN(nn.Module):
+    """
+    Swish-Gated Linear Unit Feed-Forward Network
+    """
+
+    def __init__(self, dim, expansion_factor=4):
+        super().__init__()
+        hidden_dim = int(dim * expansion_factor)
+
+        self.w12 = nn.Linear(dim, 2 * hidden_dim)
+        self.w3 = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x):
+        x1, x2 = self.w12(x).chunk(2, dim=-1)
+        return self.w3(F.silu(x1) * x2)
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU):
         super().__init__()
@@ -92,12 +108,10 @@ class Mlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 class AttentionRoPE(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False):
+    def __init__(self, dim, num_heads=8, qkv_bias=True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
@@ -105,28 +119,27 @@ class AttentionRoPE(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)
-        
+
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
-        
+
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
+        x = F.scaled_dot_product_attention(q, k, v)
+        x = self.proj(x.transpose(1, 2).reshape(B, N, C))
         return x
 
 class ViTBlockAdaLNZero(nn.Module):
     def __init__(self, hidden_dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.attn = AttentionRoPE(hidden_dim, num_heads=num_heads, qkv_bias=True)
-        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.mlp = Mlp(hidden_dim, int(hidden_dim * mlp_ratio))
+        self.norm1 = nn.RMSNorm(hidden_dim, eps=1e-6)
+        self.attn = AttentionRoPE(hidden_dim, num_heads=num_heads)
+        self.norm2 = nn.RMSNorm(hidden_dim, eps=1e-6)
+        
+        # self.mlp = Mlp(hidden_dim, int(hidden_dim * mlp_ratio))
+        self.mlp = SwiGLUFFN(hidden_dim, expansion_factor=2 / 3 * mlp_ratio)
         
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -144,20 +157,50 @@ class ViTBlockAdaLNZero(nn.Module):
 class MLPMixerBlock(nn.Module):
     def __init__(self, seq_len, hidden_dim, tokens_mlp_dim, channels_mlp_dim):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.token_mix = Mlp(seq_len, tokens_mlp_dim, seq_len)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.channel_mix = Mlp(hidden_dim, channels_mlp_dim, hidden_dim)
-        self.mixer_norm = nn.RMSNorm(hidden_dim, elementwise_affine=True)
+        self.norm1 = nn.RMSNorm(hidden_dim, eps=1e-6)
+        self.token_mix = Mlp(seq_len, tokens_mlp_dim, seq_len, act_layer=nn.SiLU)
+        self.norm2 = nn.RMSNorm(hidden_dim, eps=1e-6)
+        self.channel_mix = Mlp(hidden_dim, channels_mlp_dim, hidden_dim, act_layer=nn.SiLU)
+        # self.mixer_norm = nn.RMSNorm(hidden_dim, elementwise_affine=True)
+
+        self.alpha1 = nn.Parameter(torch.tensor([0.0]))
+        self.alpha2 = nn.Parameter(torch.tensor([0.0]))
 
     def forward(self, x):
         res = x
         x = self.norm1(x).transpose(1, 2)
         x = self.token_mix(x).transpose(1, 2)
-        x = x + res
-        x = x + self.channel_mix(self.norm2(x))
-        x = self.mixer_norm(x)
+        x = res + self.alpha1 * x
+        x = x + self.alpha2 * self.channel_mix(self.norm2(x))
+        # x = self.mixer_norm(x)
         return x
+
+class Reshape(nn.Module):
+    def __init__(self, *args):
+        super(Reshape, self).__init__()
+        self.shape = args
+
+    def forward(self, x):
+        return x.reshape(self.shape)
+
+
+class ModulatedLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, use_modulation=False):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        if use_modulation:
+            self.norm = nn.RMSNorm(in_features, eps=1e-6)
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(in_features, 2 * in_features, bias=bias)
+            )
+        self.use_modulation = use_modulation
+
+    def forward(self, x, cond=None):
+        if self.use_modulation:
+            shift, scale = self.adaLN_modulation(cond).chunk(2, dim=-1)
+            x = modulate(self.norm(x), shift, scale)
+        return self.linear(x)
+
 
 # ==========================================
 # 4. Sphere Encoder
@@ -165,8 +208,8 @@ class MLPMixerBlock(nn.Module):
 
 class SphereEncoderViT(nn.Module):
     def __init__(self, img_size=256, patch_size=16, in_channels=3,
-                 hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, latent_channels=16,
-                 mixer_layers=4, tokens_mlp_ratio=0.5, channels_mlp_ratio=4.0, class_embed_dropout=0.1):
+                 hidden_dim=512, depth=8, num_heads=8, num_classes=1000, latent_channels=256,
+                 mixer_layers=4, tokens_mlp_ratio=1.0, channels_mlp_ratio=2.0, class_embed_dropout=0.1):
         super().__init__()
         self.grid_size = img_size // patch_size
         self.seq_len = self.grid_size ** 2
@@ -185,17 +228,18 @@ class SphereEncoderViT(nn.Module):
         # RoPE Frequencies
         self.register_buffer("freqs_cis", precompute_freqs_cis_2d(self.grid_size, hidden_dim // num_heads))
         
-        # Class Conditioning
-        self.class_embed = nn.Embedding(num_classes, hidden_dim)
-        self.null_class_embed = nn.Parameter(torch.zeros(1, hidden_dim))
-        
+        self.num_classes = num_classes
+
+        # Class Conditioning (index num_classes is the learned null/unconditional embedding)
+        self.class_embed = nn.Embedding(num_classes + 1, hidden_dim)
+
         # ViT Blocks
         self.vit_blocks = nn.ModuleList([
             ViTBlockAdaLNZero(hidden_dim, num_heads) for _ in range(depth)
         ])
-        
+
         # MLP-Mixer at the END of the encoder
-        self.ffn = nn.Linear(hidden_dim, latent_channels) # todo replace with modulated linear layer
+        self.ffn = ModulatedLinear(hidden_dim, latent_channels, use_modulation=True)
 
         tokens_mlp_dim = int(self.seq_len * tokens_mlp_ratio)
         channels_mlp_dim = int(latent_channels * channels_mlp_ratio)
@@ -203,40 +247,54 @@ class SphereEncoderViT(nn.Module):
             MLPMixerBlock(self.seq_len, latent_channels, tokens_mlp_dim, channels_mlp_dim)
             for _ in range(mixer_layers)
         ])
+        self.norm = nn.RMSNorm(latent_channels, eps=1e-6)
 
-        # self.ffn = ModulatedLinear(
-        #         self.hidden_size, intermediate_chns, use_modulation=self.use_modulation
-        #     )
-        
         self.initialize_weights()
 
     def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
         w1 = self.patch_embed[0].weight.data
         nn.init.xavier_uniform_(w1.view(w1.shape[0], -1))
         w2 = self.patch_embed[1].weight.data
         nn.init.xavier_uniform_(w2.view(w2.shape[0], -1))
         nn.init.constant_(self.patch_embed[1].bias, 0)
+
         nn.init.normal_(self.class_embed.weight, std=0.02)
-        nn.init.normal_(self.null_class_embed, std=0.02)
+
+        for block in self.vit_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        nn.init.constant_(self.ffn.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.ffn.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.ffn.linear.weight, 0)
+        nn.init.constant_(self.ffn.linear.bias, 0)
 
     def forward(self, x, class_labels=None):
         B = x.shape[0]
         x = self.patch_embed(x).flatten(2).transpose(1, 2)
         x = x + self.pos_embed
-        
-        c = self.class_embed(class_labels) if class_labels is not None else self.null_class_embed.expand(B, -1)
+
+        c_idx = class_labels if class_labels is not None else torch.full((B,), self.num_classes, device=x.device, dtype=torch.long)
         if class_labels is not None and self.training and self.class_embed_dropout > 0:
             dropout_mask = torch.rand(B, device=x.device) < self.class_embed_dropout
-            c = torch.where(dropout_mask.unsqueeze(1), self.null_class_embed.expand(B, -1), c)
-        
+            c_idx = torch.where(dropout_mask, torch.full_like(c_idx, self.num_classes), c_idx)
+        c = self.class_embed(c_idx)
+
         for vit_blk in self.vit_blocks:
             x = vit_blk(x, c, self.freqs_cis)
-            
-        x = self.ffn(x)
+
+        x = self.ffn(x, c)
         for mixer_blk in self.mixer_blocks:
             x = mixer_blk(x)
+        x = self.norm(x)
 
-            
         return x
 
 # ==========================================
@@ -245,18 +303,20 @@ class SphereEncoderViT(nn.Module):
 
 class SphereDecoderViT(nn.Module):
     def __init__(self, img_size=256, patch_size=16, out_channels=3,
-                 hidden_dim=1024, depth=24, num_heads=16, num_classes=1000, latent_channels=16,
-                 mixer_layers=4, tokens_mlp_ratio=0.5, channels_mlp_ratio=4.0):
+                 hidden_dim=512, depth=8, num_heads=8, num_classes=1000, latent_channels=256,
+                 mixer_layers=4, tokens_mlp_ratio=1.0, channels_mlp_ratio=2.0, class_embed_dropout=0.1):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
         self.grid_size = img_size // patch_size
         self.seq_len = self.grid_size ** 2
+        self.class_embed_dropout = class_embed_dropout
         
         # MLP-Mixer at the BEGINNING of the decoder
         tokens_mlp_dim = int(self.seq_len * tokens_mlp_ratio)
         channels_mlp_dim = int(hidden_dim * channels_mlp_ratio)
         self.ffn = nn.Linear(latent_channels, hidden_dim)
+        self.norm = nn.RMSNorm(hidden_dim, eps=1e-6)
         self.mixer_blocks = nn.ModuleList([
             MLPMixerBlock(self.seq_len, hidden_dim, tokens_mlp_dim, channels_mlp_dim)
             for _ in range(mixer_layers)
@@ -270,46 +330,80 @@ class SphereDecoderViT(nn.Module):
         # RoPE Frequencies
         self.register_buffer("freqs_cis", precompute_freqs_cis_2d(self.grid_size, hidden_dim // num_heads))
         
-        # Class Conditioning
-        self.class_embed = nn.Embedding(num_classes, hidden_dim)
-        self.null_class_embed = nn.Parameter(torch.zeros(1, hidden_dim))
-        
+        self.num_classes = num_classes
+
+        # Class Conditioning (index num_classes is the learned null/unconditional embedding)
+        self.class_embed = nn.Embedding(num_classes + 1, hidden_dim)
+
         # ViT Blocks
         self.vit_blocks = nn.ModuleList([
             ViTBlockAdaLNZero(hidden_dim, num_heads) for _ in range(depth)
         ])
-        self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        
+
         # Unpatchify Head
-        self.head = nn.Linear(hidden_dim, patch_size * patch_size * out_channels) # todo replace with conv2d head
+        self.head = ModulatedLinear(hidden_dim, patch_size * patch_size * out_channels, use_modulation=True)
+        self.conv_norm_head = nn.Sequential(
+            nn.Conv2d(3, 3, stride=1, kernel_size=3, padding=1, padding_mode="reflect"),
+            nn.Tanh(),
+        )
         
         self.initialize_weights()
 
     def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # decoder input linear uses normal init (matches reference x_embedder init)
+        nn.init.normal_(self.ffn.weight)
+        nn.init.constant_(self.ffn.bias, 0)
+
         nn.init.normal_(self.class_embed.weight, std=0.02)
-        nn.init.normal_(self.null_class_embed, std=0.02)
+
+        for block in self.vit_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        nn.init.constant_(self.head.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.head.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.head.linear.weight, 0)
+        nn.init.constant_(self.head.linear.bias, 0)
+
+        # pixel head Conv2d with small gain (matches reference out[-2] init)
+        w = self.conv_norm_head[0].weight.data
+        nn.init.xavier_uniform_(w.view(w.shape[0], -1), gain=0.01)
+        nn.init.constant_(self.conv_norm_head[0].bias, 0)
 
     def forward(self, x, class_labels=None):
         # Input 'x' expected shape: (B, Seq_Len, Latent_Channels)
         B = x.shape[0]
-        
+
         x = self.ffn(x)
         for mixer_blk in self.mixer_blocks:
             x = mixer_blk(x)
-            
+        x = self.norm(x)
+
         x = x + self.pos_embed
-        
-        c = self.class_embed(class_labels) if class_labels is not None else self.null_class_embed.expand(B, -1)
-        
+
+        c_idx = class_labels if class_labels is not None else torch.full((B,), self.num_classes, device=x.device, dtype=torch.long)
+        if class_labels is not None and self.training and self.class_embed_dropout > 0:
+            dropout_mask = torch.rand(B, device=x.device) < self.class_embed_dropout
+            c_idx = torch.where(dropout_mask, torch.full_like(c_idx, self.num_classes), c_idx)
+        c = self.class_embed(c_idx)
+
         for vit_blk in self.vit_blocks:
             x = vit_blk(x, c, self.freqs_cis)
-            
-        x = self.final_norm(x)
-        x = self.head(x)
-        
-        # Fold back into Image Format
-        x = x.reshape(B, self.grid_size, self.grid_size, self.patch_size, self.patch_size, -1)
-        x = x.permute(0, 5, 1, 3, 2, 4).reshape(B, -1, self.img_size, self.img_size)
+
+        x = self.head(x, c)
+
+        # Fold back into Image Format (channel-first within patch, matching reference ordering)
+        x = x.reshape(B, self.grid_size, self.grid_size, -1, self.patch_size, self.patch_size)
+        x = x.permute(0, 3, 1, 4, 2, 5).reshape(B, -1, self.img_size, self.img_size)
+
+        x = self.conv_norm_head(x)
 
         return x
     
@@ -321,6 +415,7 @@ if __name__ == "__main__":
     patch_size = 16
     in_channels = 3
     hidden_dim = 512
+    latent_channels = 256
     num_classes = 1000
     num_heads = 8
     depth = 8
@@ -331,6 +426,7 @@ if __name__ == "__main__":
         patch_size=patch_size, 
         in_channels=in_channels, 
         hidden_dim=hidden_dim, 
+        latent_channels=latent_channels,
         num_classes=num_classes,
         num_heads=num_heads,
         depth=depth,
@@ -341,6 +437,7 @@ if __name__ == "__main__":
         patch_size=patch_size, 
         out_channels=in_channels, 
         hidden_dim=hidden_dim, 
+        latent_channels=latent_channels,
         num_classes=num_classes,
         num_heads=num_heads,
         depth=depth,

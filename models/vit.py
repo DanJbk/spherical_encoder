@@ -68,7 +68,7 @@ class Spherefiy(nn.Module):
         super().__init__()
         self.sigma_max = torch.tan(torch.deg2rad(torch.tensor([alpha_max], device="cpu", dtype=torch.float32))).item()
         self.sigma_max_ceiling = torch.tan(torch.deg2rad(torch.tensor([alpha_max_ceiling], device="cpu", dtype=torch.float32))).item()
-        self.cached_noise = None
+
         self.apply_angle_augmentation = apply_angle_augmentation
 
     def forward(self, latents, train=False):
@@ -88,6 +88,7 @@ class Spherefiy(nn.Module):
 
             if self.apply_angle_augmentation:
                 sigma_augmented = sigma_max + torch.rand(latents.shape[0], device=device).view(view_shape) * (self.sigma_max_ceiling - sigma_max)
+                sigma_augmented = sigma_augmented * r
                 augment_mask = (torch.rand(latents.shape[0], device=device) < 0.1).view(view_shape)
                 sigma = torch.where(augment_mask, sigma_augmented, sigma)
         
@@ -100,9 +101,9 @@ class Spherefiy(nn.Module):
         
         return latents, None, None
 
-    def sample(self, encoder, decoder, latent_shape, class_label, cfg_scale=1.0, do_enc_cfg=False, do_dec_cfg=False, T=4, r=1.0, device="cpu"):
+    def sample(self, encoder, decoder, latent_shape, class_label=None, cfg_scale=1.0, do_enc_cfg=False, do_dec_cfg=False, T=4, r=1.0, device="cpu"):
 
-        self.cached_noise = torch.randn(latent_shape, device=device)
+        cached_noise = torch.randn(latent_shape, device=device)
         
         if do_dec_cfg or do_enc_cfg:
             assert cfg_scale is not None, "cfg_scale must be provided if using classifier-free guidance"
@@ -110,7 +111,7 @@ class Spherefiy(nn.Module):
         if do_enc_cfg and do_dec_cfg:
             cfg_scale = cfg_scale**0.5
 
-        v = F.rms_norm(self.cached_noise, latent_shape[1:], eps=1e-6)
+        v = F.rms_norm(cached_noise, latent_shape[1:], eps=1e-6)
         x = decoder(v, class_label)
 
         if do_dec_cfg:
@@ -125,7 +126,7 @@ class Spherefiy(nn.Module):
                 z = z_uncond + cfg_scale * (z - z_uncond)
 
             z = F.rms_norm(z, z.shape[1:], eps=1e-6)
-            v = F.rms_norm((z + self.sigma_max * r * self.cached_noise), z.shape[1:], eps=1e-6)
+            v = F.rms_norm((z + self.sigma_max * r * cached_noise), z.shape[1:], eps=1e-6)
 
             x = decoder(v, class_label)
 
@@ -333,8 +334,6 @@ class SphereEncoderViT(nn.Module):
 
         nn.init.constant_(self.ffn.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.ffn.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.ffn.linear.weight, 0)
-        nn.init.constant_(self.ffn.linear.bias, 0)
 
     def forward(self, x, class_labels=None):
         B = x.shape[0]
@@ -429,8 +428,6 @@ class SphereDecoderViT(nn.Module):
 
         nn.init.constant_(self.head.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.head.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.head.linear.weight, 0)
-        nn.init.constant_(self.head.linear.bias, 0)
 
         # pixel head Conv2d with small gain (matches reference out[-2] init)
         w = self.conv_norm_head[0].weight.data
@@ -466,7 +463,47 @@ class SphereDecoderViT(nn.Module):
         x = self.conv_norm_head(x)
 
         return x
-    
+
+
+class Model(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        
+        self.args = kwargs.copy()
+
+        decoder_kwargs = kwargs.copy() # Copy so we don't mutate the original
+        decoder_kwargs["out_channels"] = decoder_kwargs.pop("in_channels")
+        
+        self.encoder = SphereEncoderViT(**kwargs)
+        self.decoder = SphereDecoderViT(**decoder_kwargs)
+
+        self.spherefiy = Spherefiy()
+
+    def forward(self, x, labels, cfg_scale=2.0, do_enc_cfg=True, do_dec_cfg=True, T=4, r=1.0):
+        if self.training:
+            latents_cond = self.encoder(x, class_labels=labels)
+            spherified_latents_cond, noisy, less_noisy = self.spherefiy(latents_cond, train=True) # (Placeholder)
+
+            x_NOISY = self.decoder(noisy, class_labels=labels)
+            x_noisy = self.decoder(less_noisy, class_labels=labels)
+
+            x_noisy_sg = x_noisy.detach().clone()
+            v_one_step =  self.encoder(x_NOISY, class_labels=labels)
+
+            return x, spherified_latents_cond, x_NOISY, x_noisy, x_noisy_sg, v_one_step
+        
+        else:
+            latent_channel_size = self.args["latent_channels"]
+            return self.spherefiy.sample(
+                self.encoder, 
+                self.decoder, 
+                latent_shape=(1, latent_channel_size, latent_channel_size), 
+                class_label=labels, cfg_scale=cfg_scale, do_enc_cfg=do_enc_cfg, 
+                do_dec_cfg=do_dec_cfg, 
+                T=T, 
+                r=r, 
+                device=x.device
+            )
 
 if __name__ == "__main__":
     # --- Configuration ---
@@ -524,7 +561,9 @@ if __name__ == "__main__":
 
     # ---> YOUR SPHERIFICATION LOGIC GOES HERE <---
     # e.g., v = f(latents_cond + sigma * e)
-    spherified_latents_cond, _, _ = spherefiy(latents_cond) # (Placeholder)
+    spherified_latents_cond, noisy, less_noisy = spherefiy(latents_cond, train=True) # (Placeholder)
+    print(f"{noisy.shape=}")
+    print(f"{less_noisy.shape=}")
 
     # 2. Decode
     recon_cond = decoder(spherified_latents_cond, class_labels=dummy_labels)
@@ -539,7 +578,7 @@ if __name__ == "__main__":
     latents_uncond = encoder(dummy_img, class_labels=None)
     
     # ---> YOUR SPHERIFICATION LOGIC GOES HERE <---
-    spherified_latents_uncond = latents_uncond # (Placeholder)
+    spherified_latents_uncond, _, _ = spherefiy(latents_cond) # (Placeholder)
     
     recon_uncond = decoder(spherified_latents_uncond, class_labels=None)
     print(f"Unconditional Decoder Output Shape: {recon_uncond.shape}")
@@ -548,3 +587,5 @@ if __name__ == "__main__":
     total_params += sum(p.numel() for p in decoder.parameters() if p.requires_grad)
     print(f"Total Parameters: {total_params}")
 
+    samples = spherefiy.sample(encoder, decoder, latent_shape=(2, 256, 256), class_label=torch.tensor([42]), cfg_scale=2.0, do_enc_cfg=True, do_dec_cfg=True, T=4, r=1.0, device="cpu")
+    print(samples.shape)

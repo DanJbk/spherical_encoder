@@ -63,17 +63,77 @@ def apply_rotary_emb(x, freqs_cis):
     return x_out.type_as(x)
 
 
-def sphereify(latents, sigma=1, noise=None):
-    latents = F.rms_norm(latents, latents.shape[1:], eps=1e-6)
+class Spherefiy(nn.Module):
+    def __init__(self, alpha_max=85, alpha_max_ceiling=89, apply_angle_augmentation=True):
+        super().__init__()
+        self.sigma_max = torch.tan(torch.deg2rad(torch.tensor([alpha_max], device="cpu", dtype=torch.float32))).item()
+        self.sigma_max_ceiling = torch.tan(torch.deg2rad(torch.tensor([alpha_max_ceiling], device="cpu", dtype=torch.float32))).item()
+        self.cached_noise = None
+        self.apply_angle_augmentation = apply_angle_augmentation
 
-    if noise:
-        view_shape = [latents.shape[0]] + [1] * (latents.ndim - 1)
+    def forward(self, latents, train=False):
+        return self.sphereify(latents, self.sigma_max, train=train)
+
+    def sphereify(self, latents, sigma_max=0, train=False):
+        device = latents.device
+        latents = F.rms_norm(latents, latents.shape[1:], eps=1e-6)
+
+        if train:
+            view_shape = (latents.shape[0],) + (1,) * (len(latents.shape) - 1)
+            r = torch.rand(latents.shape[0], device=device).view(view_shape)
+            s = torch.rand(latents.shape[0], device=device).view(view_shape) * 0.5
+            e = torch.randn_like(latents, device=device)
+
+            sigma = sigma_max * r
+
+            if self.apply_angle_augmentation:
+                sigma_augmented = sigma_max + torch.rand(latents.shape[0], device=device).view(view_shape) * (self.sigma_max_ceiling - sigma_max)
+                augment_mask = (torch.rand(latents.shape[0], device=device) < 0.1).view(view_shape)
+                sigma = torch.where(augment_mask, sigma_augmented, sigma)
         
-        sigma = (sigma * torch.rand(latents.shape[0])).view(*view_shape)
-        noise_latent = torch.randn_like(latents)
-        latents = F.rms_norm((latents + sigma * noise_latent), latents.shape[1:], eps=1e-6)
-    
-    return latents
+            sigma_sub = sigma * s
+            
+            latents_big = F.rms_norm((latents + sigma * e), latents.shape[1:], eps=1e-6)
+            latents_small = F.rms_norm((latents + sigma_sub * e), latents.shape[1:], eps=1e-6)
+
+            return latents, latents_big, latents_small
+        
+        return latents, None, None
+
+    def sample(self, encoder, decoder, latent_shape, class_label, cfg_scale=1.0, do_enc_cfg=False, do_dec_cfg=False, T=4, r=1.0, device="cpu"):
+
+        self.cached_noise = torch.randn(latent_shape, device=device)
+        
+        if do_dec_cfg or do_enc_cfg:
+            assert cfg_scale is not None, "cfg_scale must be provided if using classifier-free guidance"
+        
+        if do_enc_cfg and do_dec_cfg:
+            cfg_scale = cfg_scale**0.5
+
+        v = F.rms_norm(self.cached_noise, latent_shape[1:], eps=1e-6)
+        x = decoder(v, class_label)
+
+        if do_dec_cfg:
+            x_uncond = decoder(v, None)
+            x = x_uncond + cfg_scale * (x - x_uncond)
+
+        for _ in range(T - 1):
+            z = encoder(x, class_label)
+
+            if do_enc_cfg:
+                z_uncond = encoder(x, None)
+                z = z_uncond + cfg_scale * (z - z_uncond)
+
+            z = F.rms_norm(z, z.shape[1:], eps=1e-6)
+            v = F.rms_norm((z + self.sigma_max * r * self.cached_noise), z.shape[1:], eps=1e-6)
+
+            x = decoder(v, class_label)
+
+            if do_dec_cfg:
+                x_uncond = decoder(v, None)
+                x = x_uncond + cfg_scale * (x - x_uncond)
+                
+        return x
 
 # ==========================================
 # 3. Core Transformer Blocks
@@ -443,6 +503,8 @@ if __name__ == "__main__":
         depth=depth,
     )
 
+    spherefiy = Spherefiy()
+
     # --- Dummy Inputs ---
     dummy_img = torch.randn(batch_size, in_channels, img_size, img_size)
     dummy_labels = torch.randint(0, num_classes, (batch_size,))
@@ -462,7 +524,7 @@ if __name__ == "__main__":
 
     # ---> YOUR SPHERIFICATION LOGIC GOES HERE <---
     # e.g., v = f(latents_cond + sigma * e)
-    spherified_latents_cond = latents_cond # (Placeholder)
+    spherified_latents_cond, _, _ = spherefiy(latents_cond) # (Placeholder)
 
     # 2. Decode
     recon_cond = decoder(spherified_latents_cond, class_labels=dummy_labels)

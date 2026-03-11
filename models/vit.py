@@ -74,7 +74,7 @@ class Spherefiy(nn.Module):
     def forward(self, latents, train=False):
         return self.sphereify(latents, self.sigma_max, train=train)
 
-    def sphereify(self, latents, sigma_max=0, train=False):
+    def sphereify(self, latents, sigma_max=11, train=False):
         device = latents.device
         latents = F.rms_norm(latents, latents.shape[1:], eps=1e-6)
 
@@ -88,7 +88,6 @@ class Spherefiy(nn.Module):
 
             if self.apply_angle_augmentation:
                 sigma_augmented = sigma_max + torch.rand(latents.shape[0], device=device).view(view_shape) * (self.sigma_max_ceiling - sigma_max)
-                sigma_augmented = sigma_augmented * r
                 augment_mask = (torch.rand(latents.shape[0], device=device) < 0.1).view(view_shape)
                 sigma = torch.where(augment_mask, sigma_augmented, sigma)
         
@@ -471,7 +470,7 @@ class Model(nn.Module):
         
         self.args = kwargs.copy()
 
-        decoder_kwargs = kwargs.copy() # Copy so we don't mutate the original
+        decoder_kwargs = kwargs.copy()
         decoder_kwargs["out_channels"] = decoder_kwargs.pop("in_channels")
         
         self.encoder = SphereEncoderViT(**kwargs)
@@ -480,7 +479,7 @@ class Model(nn.Module):
         self.spherefiy = Spherefiy()
 
     def forward(self, x, labels, cfg_scale=2.0, do_enc_cfg=True, do_dec_cfg=True, T=4, r=1.0):
-        if self.training:
+        if True:
             latents_cond = self.encoder(x, class_labels=labels)
             spherified_latents_cond, noisy, less_noisy = self.spherefiy(latents_cond, train=True) # (Placeholder)
 
@@ -507,15 +506,27 @@ class Model(nn.Module):
 
 if __name__ == "__main__":
     # --- Configuration ---
+    # batch_size = 2
+    # # img_size = 256
+    # img_size = 32
+    # patch_size = 16
+    # in_channels = 3
+    # hidden_dim = 512
+    # latent_channels = 256
+    # num_classes = 1000
+    # num_heads = 8
+    # depth = 8
+
     batch_size = 2
-    img_size = 256
-    patch_size = 16
+    img_size = 32
+    patch_size = 2
     in_channels = 3
-    hidden_dim = 512
-    latent_channels = 256
-    num_classes = 1000
-    num_heads = 8
-    depth = 8
+    hidden_dim = 384
+    latent_channels = 8
+    num_classes = 10
+    num_heads = 6
+    depth = 12
+
 
     print("Instantiating Sphere Encoder and Decoder...")
     encoder = SphereEncoderViT(
@@ -587,5 +598,17 @@ if __name__ == "__main__":
     total_params += sum(p.numel() for p in decoder.parameters() if p.requires_grad)
     print(f"Total Parameters: {total_params}")
 
-    samples = spherefiy.sample(encoder, decoder, latent_shape=(2, 256, 256), class_label=torch.tensor([42]), cfg_scale=2.0, do_enc_cfg=True, do_dec_cfg=True, T=4, r=1.0, device="cpu")
+    seq_len = (img_size // patch_size) ** 2
+    print(f"latent shape: {(2, seq_len, latent_channels)}")
+    samples = spherefiy.sample(
+        encoder, 
+        decoder, 
+        latent_shape=(2, seq_len, latent_channels), 
+        class_label=torch.tensor([42, 11]), 
+        cfg_scale=2.0, do_enc_cfg=True, 
+        do_dec_cfg=True, 
+        T=4, 
+        r=1.0, 
+        device="cpu"
+    )
     print(samples.shape)

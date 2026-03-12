@@ -23,9 +23,9 @@ class CIFAR10AutoencoderDataset(Dataset):
         return len(self.cifar)
 
     def __getitem__(self, idx):
-        img, _label = self.cifar[idx] # We discard the label
+        img, label = self.cifar[idx] # We discard the label
         # Return (input, target). For a basic autoencoder, they are identical.
-        return img, img
+        return img, label
 
 # ---------------------------------------------------------
 # 2. Dummy Model (Matching our custom output requirement)
@@ -46,7 +46,7 @@ class DummyAutoencoder(nn.Module):
             nn.Tanh()
         )
 
-    def forward(self, x):
+    def forward(self, x, y):
         latent = self.encoder(x)
         out = self.decoder(latent)
         
@@ -54,16 +54,18 @@ class DummyAutoencoder(nn.Module):
         # The trainer specifically looks for the "pred" key to save the image.
         return {
             "pred": out, 
+            "targets": x,
             "latent": latent.view(latent.size(0), -1)
         }
 
 # ---------------------------------------------------------
 # 3. Custom Loss Function
 # ---------------------------------------------------------
-def custom_loss_fn(outputs: dict[str, torch.Tensor], targets: torch.Tensor):
+def custom_loss_fn(outputs: dict[str, torch.Tensor], labels: torch.Tensor):
     # Unpack from the dictionary
     pred_images = outputs["pred"]
     latent_vectors = outputs["latent"]
+    targets = outputs["targets"]
     
     # Primary loss
     mse_loss = nn.functional.mse_loss(pred_images, targets)
@@ -96,7 +98,7 @@ if __name__ == "__main__":
         ema_decay=0.999,
         total_epochs=5,       # Just 5 epochs for a quick test
         warmup_epochs=1,
-        viz_freq=1,           # Save images every epoch so you can see it work instantly
+        viz_freq=0,           # Save images every epoch so you can see it work instantly
         checkpoint_freq=2,
         output_dir=Path("runs/cifar10_test")
     )

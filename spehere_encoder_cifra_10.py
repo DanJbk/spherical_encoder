@@ -8,9 +8,8 @@ from trainer.config import TrainerConfig, CSVLogger
 from models.vit import Model
 from losses.loss import CombinedLoss
 
-# ---------------------------------------------------------
-# 1. Dataset Wrapper (Image-to-Image for CIFAR-10)
-# ---------------------------------------------------------
+# Dataset Wrapper (Image-to-Image for CIFAR-10)
+
 class CIFAR10AutoencoderDataset(Dataset):
     def __init__(self, root: str = "./data", train: bool = True):
         # We normalize to [-1, 1] because our trainer's visualization 
@@ -35,47 +34,8 @@ class CIFAR10AutoencoderDataset(Dataset):
         return img, label
 
 
-# ---------------------------------------------------------
-# 3. Custom Model (Matching our custom output requirement)
-# ---------------------------------------------------------
+# Execution setup
 
-class Model_Wrapper(nn.Module):
-    def __init__(self, 
-        img_size,
-        patch_size,
-        in_channels,
-        hidden_dim,
-        latent_channels,
-        num_classes,
-        num_heads,
-        depth
-    ):
-        super().__init__()
-        self.model = Model(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_channels=in_channels,
-            hidden_dim=hidden_dim,
-            latent_channels=latent_channels,
-            num_classes=num_classes,
-            num_heads=num_heads,
-            depth=depth
-        )
-    
-    def forward(self, x, label=None):
-        x, spherified_latents_cond, x_NOISY, x_noisy, x_noisy_sg, v_one_step = self.model(x, label)
-        return {
-            "x": x,
-            "spherified_latents_cond": spherified_latents_cond,
-            "x_NOISY": x_NOISY,
-            "x_noisy": x_noisy,
-            "x_noisy_sg": x_noisy_sg,
-            "v_one_step": v_one_step
-        }
-
-# ---------------------------------------------------------
-# 4. Execution setup
-# ---------------------------------------------------------
 if __name__ == "__main__":
     # Setup data
     train_dataset = CIFAR10AutoencoderDataset(train=True)
@@ -96,9 +56,9 @@ if __name__ == "__main__":
     depth = 12
 
     resume_checkpoint = False
-    output_dir = Path("runs8/cifar10_test")
+    output_dir = Path("runs10/cifar10_test")
 
-    model = Model_Wrapper(
+    model = Model(
         img_size=img_size, 
         patch_size=patch_size, 
         in_channels=in_channels, 

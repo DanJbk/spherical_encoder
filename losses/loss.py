@@ -42,11 +42,11 @@ class CombinedLoss(nn.Module):
         self.preceptual_loss_pix_con = L1PerceptualLoss(wl1=0.5, wperc=0.5).to(device)
 
 
-    def forward(self, outputs: dict[str, torch.Tensor], targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, outputs: dict[str, torch.Tensor], targets: torch.Tensor):
         l_pix_recon = self.preceptual_loss_pix_recon(outputs["x_noisy"], outputs["x"])
         l_pix_con = self.preceptual_loss_pix_con(outputs["x_NOISY"], outputs["x_noisy_sg"])
         cosine_similarity_loss_value = latent_consistency_loss(outputs["spherified_latents_cond"], outputs["v_one_step"])
 
         total_loss = l_pix_recon + l_pix_con + cosine_similarity_loss_value * 0.1
         
-        return total_loss, {}
+        return total_loss, {"l_pix_recon": l_pix_recon.item(), "l_pix_con": l_pix_con.item(), "cosine_similarity_loss": cosine_similarity_loss_value.item()}

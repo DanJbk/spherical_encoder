@@ -2,17 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ==========================================
-# 1. Utility & Normalization Modules
-# ==========================================
+from .mixer import MLPMixerBlock
+
 
 def modulate(x, shift, scale):
     """Applies AdaLN modulation."""
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-# ==========================================
-# 2. Positional Embeddings (Absolute & RoPE)
-# ==========================================
+# Positional Embeddings (Absolute & RoPE)
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size):
     """Generates standard 2D sinusoidal absolute positional encoding."""
@@ -135,9 +132,7 @@ class Spherefiy(nn.Module):
                 
         return x
 
-# ==========================================
-# 3. Core Transformer Blocks
-# ==========================================
+# Core Transformer Blocks
 
 class SwiGLUFFN(nn.Module):
     """
@@ -155,17 +150,6 @@ class SwiGLUFFN(nn.Module):
         x1, x2 = self.w12(x).chunk(2, dim=-1)
         return self.w3(F.silu(x1) * x2)
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU):
-        super().__init__()
-        hidden_features = hidden_features or in_features
-        out_features = out_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
 
 class AttentionRoPE(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=True):
@@ -214,26 +198,6 @@ class ViTBlockAdaLNZero(nn.Module):
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
-class MLPMixerBlock(nn.Module):
-    def __init__(self, seq_len, hidden_dim, tokens_mlp_dim, channels_mlp_dim):
-        super().__init__()
-        self.norm1 = nn.RMSNorm(hidden_dim, eps=1e-6)
-        self.token_mix = Mlp(seq_len, tokens_mlp_dim, seq_len, act_layer=nn.SiLU)
-        self.norm2 = nn.RMSNorm(hidden_dim, eps=1e-6)
-        self.channel_mix = Mlp(hidden_dim, channels_mlp_dim, hidden_dim, act_layer=nn.SiLU)
-        # self.mixer_norm = nn.RMSNorm(hidden_dim, elementwise_affine=True)
-
-        self.alpha1 = nn.Parameter(torch.tensor([0.0]))
-        self.alpha2 = nn.Parameter(torch.tensor([0.0]))
-
-    def forward(self, x):
-        res = x
-        x = self.norm1(x).transpose(1, 2)
-        x = self.token_mix(x).transpose(1, 2)
-        x = res + self.alpha1 * x
-        x = x + self.alpha2 * self.channel_mix(self.norm2(x))
-        # x = self.mixer_norm(x)
-        return x
 
 class Reshape(nn.Module):
     def __init__(self, *args):
@@ -262,9 +226,7 @@ class ModulatedLinear(nn.Module):
         return self.linear(x)
 
 
-# ==========================================
-# 4. Sphere Encoder
-# ==========================================
+# Sphere Encoder
 
 class SphereEncoderViT(nn.Module):
     def __init__(self, img_size=256, patch_size=16, in_channels=3,
@@ -355,9 +317,7 @@ class SphereEncoderViT(nn.Module):
 
         return x
 
-# ==========================================
-# 5. Sphere Decoder
-# ==========================================
+# Sphere Decoder
 
 class SphereDecoderViT(nn.Module):
     def __init__(self, img_size=256, patch_size=16, out_channels=3,
@@ -415,7 +375,6 @@ class SphereDecoderViT(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # decoder input linear uses normal init (matches reference x_embedder init)
         nn.init.normal_(self.ffn.weight)
         nn.init.constant_(self.ffn.bias, 0)
 
@@ -479,43 +438,28 @@ class Model(nn.Module):
         self.spherefiy = Spherefiy()
 
     def forward(self, x, labels, cfg_scale=2.0, do_enc_cfg=True, do_dec_cfg=True, T=4, r=1.0):
-        if True:
-            latents_cond = self.encoder(x, class_labels=labels)
-            spherified_latents_cond, noisy, less_noisy = self.spherefiy(latents_cond, train=True) # (Placeholder)
 
-            x_NOISY = self.decoder(noisy, class_labels=labels)
-            x_noisy = self.decoder(less_noisy, class_labels=labels)
+        latents_cond = self.encoder(x, class_labels=labels)
+        spherified_latents_cond, noisy, less_noisy = self.spherefiy(latents_cond, train=True) # (Placeholder)
 
-            x_noisy_sg = x_noisy.detach().clone()
-            v_one_step =  self.encoder(x_NOISY, class_labels=labels)
+        x_NOISY = self.decoder(noisy, class_labels=labels)
+        x_noisy = self.decoder(less_noisy, class_labels=labels)
 
-            return x, spherified_latents_cond, x_NOISY, x_noisy, x_noisy_sg, v_one_step
+        x_noisy_sg = x_noisy.detach().clone()
+        v_one_step =  self.encoder(x_NOISY, class_labels=labels)
+
+        return {
+            "x": x,
+            "spherified_latents_cond": spherified_latents_cond,
+            "x_NOISY": x_NOISY,
+            "x_noisy": x_noisy,
+            "x_noisy_sg": x_noisy_sg,
+            "v_one_step": v_one_step
+        }
         
-        else:
-            latent_channel_size = self.args["latent_channels"]
-            return self.spherefiy.sample(
-                self.encoder, 
-                self.decoder, 
-                latent_shape=(1, latent_channel_size, latent_channel_size), 
-                class_label=labels, cfg_scale=cfg_scale, do_enc_cfg=do_enc_cfg, 
-                do_dec_cfg=do_dec_cfg, 
-                T=T, 
-                r=r, 
-                device=x.device
-            )
 
 if __name__ == "__main__":
     # --- Configuration ---
-    # batch_size = 2
-    # # img_size = 256
-    # img_size = 32
-    # patch_size = 16
-    # in_channels = 3
-    # hidden_dim = 512
-    # latent_channels = 256
-    # num_classes = 1000
-    # num_heads = 8
-    # depth = 8
 
     batch_size = 2
     img_size = 32
@@ -568,18 +512,12 @@ if __name__ == "__main__":
     # 1. Encode
     latents_cond = encoder(dummy_img, class_labels=dummy_labels)
     print(f"Encoder Output (Latents) Shape: {latents_cond.shape}") 
-    # Expected: (2, 256, 1024) where 256 is the seq_len (256//16)^2
 
-    # ---> YOUR SPHERIFICATION LOGIC GOES HERE <---
-    # e.g., v = f(latents_cond + sigma * e)
     spherified_latents_cond, noisy, less_noisy = spherefiy(latents_cond, train=True) # (Placeholder)
-    print(f"{noisy.shape=}")
-    print(f"{less_noisy.shape=}")
 
     # 2. Decode
     recon_cond = decoder(spherified_latents_cond, class_labels=dummy_labels)
     print(f"Decoder Output (Reconstruction) Shape: {recon_cond.shape}") 
-    # Expected: (2, 3, 256, 256)
 
     # ==========================================
     # Unconditional Forward Pass (CFG)
@@ -588,7 +526,6 @@ if __name__ == "__main__":
     # Setting class_labels=None triggers the learned null embedding
     latents_uncond = encoder(dummy_img, class_labels=None)
     
-    # ---> YOUR SPHERIFICATION LOGIC GOES HERE <---
     spherified_latents_uncond, _, _ = spherefiy(latents_cond) # (Placeholder)
     
     recon_uncond = decoder(spherified_latents_uncond, class_labels=None)
@@ -604,7 +541,7 @@ if __name__ == "__main__":
         encoder, 
         decoder, 
         latent_shape=(2, seq_len, latent_channels), 
-        class_label=torch.tensor([42, 11]), 
+        class_label=torch.tensor([5, 2]), 
         cfg_scale=2.0, do_enc_cfg=True, 
         do_dec_cfg=True, 
         T=4, 

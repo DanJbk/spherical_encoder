@@ -176,18 +176,18 @@ class ImageToImageTrainer:
         pbar = tqdm(self.val_loader, desc=f"Epoch {self.current_epoch} [Val]", leave=False)
         
         for step, batch in enumerate(pbar):
-            inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
+            inputs, labels = batch[0].to(self.device), batch[1].to(self.device)
             
             with torch.amp.autocast(device_type=self.device.type):
-                outputs = eval_model(inputs)
-                loss, metrics = self.loss_fn(outputs, targets)
+                outputs = eval_model(inputs, labels)
+                loss, metrics = self.loss_fn(outputs, labels)
                 
             total_loss += loss.item()
             pbar.set_postfix({"val_loss": f"{loss.item():.4f}"})
             
             if step == 0 and self.config.viz_freq > 0 and self.current_epoch % self.config.viz_freq == 0:
                 pred_img = outputs if isinstance(outputs, torch.Tensor) else outputs['pred']
-                self.visualize(inputs, targets, pred_img, prefix="val")
+                self.visualize(inputs, labels, pred_img, prefix="val")
 
         return {"val_loss": total_loss / len(self.val_loader)}
 

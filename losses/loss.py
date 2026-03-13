@@ -4,13 +4,12 @@ import torch.nn.functional as F
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 class L1PerceptualLoss(nn.Module):
-    def __init__(self, wl1, wperc):
+    def __init__(self, wl1, wperc, perceptual):
         super().__init__()
 
-        self.perceptual = LearnedPerceptualImagePatchSimilarity(net_type='vgg').net
+        self.perceptual = perceptual
         
-        self.perceptual.requires_grad_(False)
-        self.perceptual.eval()
+        
         self.wl1 = wl1
         self.wperc = wperc
 
@@ -37,9 +36,13 @@ class CombinedLoss(nn.Module):
         super().__init__()
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        self.preceptual_loss_pix_recon = L1PerceptualLoss(wl1=1.0, wperc=1.0).to(device)
-        self.preceptual_loss_pix_con = L1PerceptualLoss(wl1=0.5, wperc=0.5).to(device)
+
+        self.perceptual = LearnedPerceptualImagePatchSimilarity(net_type='vgg').net
+        self.perceptual.requires_grad_(False)
+        self.perceptual.eval()
+
+        self.preceptual_loss_pix_recon = L1PerceptualLoss(wl1=1.0, wperc=1.0, perceptual=self.perceptual).to(device)
+        self.preceptual_loss_pix_con = L1PerceptualLoss(wl1=0.5, wperc=0.5, perceptual=self.perceptual).to(device)
 
 
     def forward(self, outputs: dict[str, torch.Tensor], targets: torch.Tensor):

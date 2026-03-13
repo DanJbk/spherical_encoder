@@ -1,4 +1,4 @@
-implmentation of Spherical encoder by meta: https://arxiv.org/abs/2602.15030
+implmentation of **Spherical Encoder** by meta: https://arxiv.org/abs/2602.15030
 
 model architecture built after the offical implmentation https://github.com/facebookresearch/sphere-encoder
 
@@ -8,3 +8,8 @@ python -m venv .venv
 source .venv/bin/activate
 python spehere_encoder_cifra_10.py
 ```
+
+
+![Alt text](assets/image.png)
+
+*class 4: Horse, after 50 epochs*

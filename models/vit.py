@@ -456,6 +456,22 @@ class Model(nn.Module):
             "x_noisy_sg": x_noisy_sg,
             "v_one_step": v_one_step
         }
+    
+    def sample(self, batch_size, class_labels, cfg_scale=2.0, do_enc_cfg=True, do_dec_cfg=True, T=4, r=1.0, device="cpu"):
+        seq_len = (self.args["img_size"] // self.args["patch_size"]) ** 2
+        latent_channels = self.args["latent_channels"]
+        return self.spherefiy.sample(
+            self.encoder, 
+            self.decoder, 
+            latent_shape=(batch_size, seq_len, latent_channels), 
+            class_label=torch.tensor(class_labels, device=device), 
+            cfg_scale=cfg_scale, 
+            do_enc_cfg=do_enc_cfg, 
+            do_dec_cfg=do_dec_cfg, 
+            T=T, 
+            r=r, 
+            device=device
+        )
         
 
 if __name__ == "__main__":

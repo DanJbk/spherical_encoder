@@ -193,7 +193,11 @@ class ImageToImageTrainer:
 
     def train(self):
         print(f"Starting training on {self.device} for {self.config.total_epochs} epochs...")
-        main_pbar = tqdm(range(self.current_epoch, self.config.total_epochs), desc="Overall Progress")
+        main_pbar = tqdm(
+            range(self.current_epoch, self.config.total_epochs), 
+            initial=self.current_epoch,
+            total=self.config.total_epochs,
+            desc="Overall Progress")
         
         try:
             for epoch in main_pbar:

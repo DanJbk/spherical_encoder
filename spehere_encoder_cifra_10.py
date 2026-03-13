@@ -56,7 +56,7 @@ if __name__ == "__main__":
     depth = 12
 
     resume_checkpoint = False
-    output_dir = Path("runs10/cifar10_test")
+    output_dir = Path("runs11/cifar10_test")
 
     model = Model(
         img_size=img_size, 
@@ -73,7 +73,7 @@ if __name__ == "__main__":
         batch_size=batch_size,
         grad_accum_steps=1,
         ema_decay=None,
-        total_epochs=100,       # Just 5 epochs for a quick test
+        total_epochs=100,     # Just 5 epochs for a quick test
         warmup_epochs=10,
         viz_freq=0,           # Save images every epoch so you can see it work instantly
         checkpoint_freq=2,
@@ -97,7 +97,7 @@ if __name__ == "__main__":
     )
     
     if resume_checkpoint:
-        latest_checkpoint = config.output_dir / "latest.pt"
+        latest_checkpoint = config.output_dir / "checkpoint_ep34.pt"
         trainer.resume_from_checkpoint(latest_checkpoint)
     
     trainer.train()
